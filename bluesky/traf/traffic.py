@@ -1,18 +1,25 @@
 import numpy as np
 from math import *
-from random import random, randint
+
 from ..tools.aero import fpm, kts, ft, nm, g0,  tas2eas, tas2mach, tas2cas, mach2tas,  \
                          mach2cas, cas2tas, cas2mach, Rearth
 
 from ..tools.aero_np import vatmos, vcas2tas, vtas2cas,  vtas2mach, vcas2mach,\
                             vmach2tas, qdrdist
 from ..tools.misc import degto180, kwikdist
+from ..tools.datalog import Datalog
 
 from route import Route
 from params import Trails
 from adsbmodel import ADSBModel
+
 from asas import Dbconf
+from asas_LOS import Dbconf2    #  LOS 
+from ..tools.datalog import Datalog #Datalogger Thom
+
+
 from .. import settings
+import pdb
 
 try:
     if settings.performance_model == 'bluesky':
@@ -40,13 +47,13 @@ class Traffic:
         deletall()           : delete all traffic
         update(sim)          : do a numerical integration step
         id2idx(name)         : return index in traffic database of given call sign
-        selhdg(i,hdg)        : set autopilot heading and activate heading select mode
-        selspd(i,spd)        : set autopilot CAS/Mach and activate heading select mode
+        selhdg(i,hdg)        : set autopilot heading and activate heading select mode 
+        selspd(i,spd)        : set autopilot CAS/Mach and activate heading select mode 
 
         engchange(i,engtype) : change engine type of an aircraft
 
         changeTrailColor(color,idx)     : change colour of trail of aircraft idx
-
+ 
         setNoise(A)          : Add turbulence
 
     Members: see create
@@ -74,6 +81,10 @@ class Traffic:
 
         self.ntraf = 0
 
+        # Create datalog instance
+        self.log = Datalog()
+        
+
         # Traffic list & arrays definition
 
         # !!!IMPORTANT NOTE!!!
@@ -100,6 +111,10 @@ class Traffic:
         self.rho    = np.array([])  # atmospheric air density [kg/m3]
         self.Temp   = np.array([])  # atmospheric air temperature [K]
         self.dtemp  = np.array([])  # delta t for non-ISA conditions
+        
+        #thom
+        self.createtime=np.array([])
+        self.timer=np.float32(0)
 
         # Traffic performance data
         self.avsdef = np.array([])  # [m/s]default vertical speed of autopilot
@@ -156,6 +171,7 @@ class Traffic:
 
         # ASAS info per aircraft:
         self.iconf      = []            # index in 'conflicting' aircraft database
+        self.iconf2     = []
         self.asasactive = np.array([])  # whether the autopilot follows ASAS or not
         self.asashdg    = np.array([])  # heading provided by the ASAS [deg]
         self.asasspd    = np.array([])  # speed provided by the ASAS (eas) [m/s]
@@ -203,6 +219,7 @@ class Traffic:
 
         # ASAS objects: Conflict Database
         self.dbconf = Dbconf(self, 300., 5. * nm, 1000. * ft)  # hard coded values to be replaced
+        self.dbconf2 = Dbconf2(self,300., 5.*nm, 1000.*ft)  #Thom: here CDR is performed with ADSB system
 
         # Import navigation data base
         self.navdb  = navdb
@@ -235,34 +252,92 @@ class Traffic:
         self.trails   = Trails()
         self.swtrails = False  # Default switched off
 
+        # ADS-B Coverage area
+        self.swAdsbCoverage = False
+
         # Noise (turbulence, ADBS-transmission noise, ADSB-truncated effect)
         self.setNoise(False)
 
         self.eps = np.array([])
+        
+        ### ---------------- Thom Variables
+        
+        ## Log variables
+        #Flight statistics
+        self.distance_2D    = np.array([])
+        self.distance_3D    = np.array([])
+        self.flightime      = np.array([])
+        self.work           = np.array([])
+        self.ACInArea       = np.array([])
+                
+        
+       
+        
+        # switches
+        self.SnapSwitch=False           # Snap logging
+        self.ConfSwitch=False            # conflict
+        self.IntSwitch=False             # Intrusion
+        self.FlstSwitch=False            # Flight statistics
+        self.TmxSwitch=False             # TMX switch
+        self.GlobSwitch=False
+        
+        self.GlobSwitch2=True #Keep always True; Switch for logging global variables only once
+        
+        # constants
+        # timer inteval for writing
+        self.t0writelog = -999  # Last time Writelog was called
+        self.dtwritelog = 180 # Interval fot writing data and clear buffer
+        # Individual loggers
+        #Snap
+        self.Snapt0=-999    # Last time
+        self.Snapdt=30.00   # Snapshot interval
+        #Conf
+        self.Conft0=-999    # Last time
+        self.Confdt=1       # Conf interval
+        #Int
+        self.Intt0=-999     # Last time 
+        self.Intdt=1        # Intrusion interval
+        #Flst
+        self.Flstt0=-999     # Last time 
+        self.Flstdt=30        # statistics
+        
+        #TMX
+        self.Tmxt0=-999     # Last time 
+        self.Tmxdt=10        # tmx
+
+        #TMX
+        self.Globt0=-999     # Last time 
+        self.Globdt=30        # Glob interval        
+        
+        
+        ## Delete/Experiment Area variables
+        self.CreateStart = 1800
+        self.CreateEnd = 3600
+        # start and stop time for logging
+        self.ExperimentStart = 1800  #Time to start logging
+        self.ExperimentEnd = 4200 # Time to end logging
+        self.ExperimentRadius = 94.5 #Experiment radius in NM
+        #Global
+        self.t0Delete =  -999.          # Initial Value
+        self.dtDelete = 3               # Delta T to check for deleting AC (now at 3 s)
+        self.DeleteSwitch=True
+        self.DeleteCenterLatLon=[0,0]          # Center location to compare distance with this lat/lon
+        self.DeleteDistance= 94.5         # NM
+        #per AC
+        self.DistanceList=np.array([])
+        self.DeleteIdx=[]
+        
+       
+        
+        
 
         return
-
-    def mcreate(self, count, actype=None, alt=None, spd=None, dest=None, area=None):
-        """ Create multiple random aircraft in a specified area """
-        idbase = chr(randint(65, 90)) + chr(randint(65, 90))
-        if actype is None:
-            actype = 'B744'
-
-        for i in xrange(count):
-            acid  = idbase + '%05d' % i
-            aclat = random() * (area[1] - area[0]) + area[0]
-            aclon = random() * (area[3] - area[2]) + area[2]
-            achdg = float(randint(1, 360))
-            acalt = (randint(2000, 39000) * ft) if alt is None else alt
-            acspd = (randint(250, 450) * kts) if spd is None else spd
-
-            self.create(acid, actype, aclat, aclon, achdg, acalt, acspd)
 
     def create(self, acid, actype, aclat, aclon, achdg, acalt, casmach):
         """Create an aircraft"""
         # Check if not already exist
         if self.id.count(acid.upper()) > 0:
-            return False, acid + " already exists."  # already exists do nothing
+            return False,acid+" already exists." # already exists do nothing
 
         # Increase number of aircraft
         self.ntraf = self.ntraf + 1
@@ -271,7 +346,7 @@ class Traffic:
         if 0.1 < casmach < 1.0 :
             acspd = mach2tas(casmach, acalt)
         else:
-            acspd = cas2tas(casmach, acalt)
+            acspd = cas2tas(casmach * kts, acalt)
 
         # Process input
         self.id.append(acid.upper())
@@ -291,6 +366,9 @@ class Traffic:
         self.gs    = np.append(self.gs, acspd)
         self.cas   = np.append(self.cas, tas2cas(acspd, acalt))
         self.M     = np.append(self.M, tas2mach(acspd, acalt))
+        
+        
+        self.createtime=np.append(self.createtime,self.timer) # Time AC is created
 
         # AC is initialized with neutral max bank angle
         self.bank = np.append(self.bank, radians(25.))
@@ -356,7 +434,7 @@ class Traffic:
 
         # ASAS info: no conflict => -1
         self.iconf.append(-1)  # index in 'conflicting' aircraft database
-
+        self.iconf2.append(-1)
         # ASAS output commanded values
         self.asasactive = np.append(self.asasactive, False)
         self.asashdg = np.append(self.asashdg, achdg)
@@ -381,6 +459,9 @@ class Traffic:
         self.lastlon = np.append(self.lastlon, aclon)
         self.lasttim = np.append(self.lasttim, 0.0)
 
+        # ADS-B Coverage area
+        self.swAdsbCoverage = False
+        
         # Transmitted data to other aircraft due to truncated effect
         self.adsbtime=np.append(self.adsbtime,np.random.rand(self.trunctime))
         self.adsblat=np.append(self.adsblat,aclat)
@@ -390,10 +471,20 @@ class Traffic:
         self.adsbtas=np.append(self.adsbtas,acspd)
         self.adsbgs=np.append(self.adsbgs,acspd)
         self.adsbvs=np.append(self.adsbvs,0.)
-
+        
         self.inconflict=np.append(self.inconflict,False)        
-
+        
         self.eps = np.append(self.eps, 0.01)
+        
+        # For ADSB module
+        self.adsb.create(acid, actype, aclat, aclon, achdg, acalt, acspd) #Thom
+        # Flight Statistics data
+        self.distance_2D    = np.append(self.distance_2D,0.)
+        self.distance_3D    = np.append(self.distance_3D,0.)
+        self.flightime      = np.append(self.flightime,0.)
+        self.work           = np.append(self.work,0.)
+        
+        self.ACInArea       = np.append(self.ACInArea,False)
 
         return True
 
@@ -406,7 +497,9 @@ class Traffic:
         # Do nothing if not found
         if idx<0:
             return False
-
+            
+        self.adsb.delete(idx) #Thom 
+        
         del self.id[idx]
         del self.type[idx]
 
@@ -484,6 +577,7 @@ class Traffic:
 
         # ASAS output commanded values
         del self.iconf[idx]
+        del self.iconf2[idx]
         self.asasactive = np.delete(self.asasactive, idx)
         self.asashdg    = np.delete(self.asashdg, idx)
         self.asasspd    = np.delete(self.asasspd, idx)
@@ -523,15 +617,29 @@ class Traffic:
         self.ntraf = self.ntraf - 1
 
         self.eps = np.delete(self.eps, idx)
+        
+        #Thom: Flight statistics
+        self.createtime     = np.delete(self.createtime,idx)
+
+        self.distance_2D    = np.delete(self.distance_2D,idx)
+        self.distance_3D    = np.delete(self.distance_3D,idx)
+        self.flightime      = np.delete(self.flightime,idx)
+        self.work           = np.delete(self.work,idx)
+        
+        self.ACInArea       = np.append(self.ACInArea,idx)
+        #End Thom
+        
         return True
 
     def update(self, simt, simdt):
+        
+        self.timer=simt
         # Update only necessary if there is traffic
         if self.ntraf == 0:
             return
-
+        self.timer=simt
+#        import pdb; pdb.set_trace()
         self.dts.append(simdt)
-
         #---------------- Atmosphere ----------------
         self.p, self.rho, self.Temp = vatmos(self.alt)
 
@@ -542,7 +650,7 @@ class Traffic:
         # below crossover altitude: CAS=const, above crossover altitude: MA = const
         # aptas hast to be calculated before delspd
         self.aptas = vcas2tas(self.aspd, self.alt)*self.belco + vmach2tas(self.ama, self.alt)*self.abco  
-        self.delspd = self.aptas - self.tas 
+        #self.delspd = self.aptas - self.tas
    
 
         ###############################################################################
@@ -577,21 +685,29 @@ class Traffic:
             self.adsbvs[i]   = self.vs[i]
 
         # New version ADSB Model
-        self.adsb.update()        
+        self.adsb.update(simt)        
 
         #------------------- ASAS update: ---------------------
         # Scheduling: when dt has passed or restart:
         if self.t0asas+self.dtasas<simt or simt<self.t0asas \
             and self.dbconf.swasas:
             self.t0asas = simt
-
             # Save old result
             iconf0 = np.array(self.iconf)
 
-            # Call with traffic database and sim data
+        
+            #Based on real loc, doeson't resolve
+            self.dbconf2.detect(simt)
+            self.dbconf2.conflictlist(simt)
+#            if np.count_nonzero(self.asasactive)>0:
+#                import pdb
+#                pdb.set_trace()
+
+            
             self.dbconf.detect()
+            #self.dbconf.conflictfilter(simt)
             self.dbconf.conflictlist(simt)
-            self.dbconf.APorASAS()
+            self.dbconf.APorASAS()  
             self.dbconf.resolve()
 
             # Reset label because of colour change
@@ -607,10 +723,14 @@ class Traffic:
             
             # FMS LNAV mode:
             qdr, dist = qdrdist(self.lat, self.lon, self.actwplat, self.actwplon) #[deg][nm])
-
-            # Check whether shift based dist [nm] is required, set closer than WP turn distance
-            iwpclose = np.where(self.swlnav*(dist < self.actwpturn))[0]
+           
             
+            # Check whether shift based dist [nm] is required, set closer than WP turn distance
+            iwpclose = np.where(self.swlnav*(dist < self.actwpturn))[0] ## NOte --->> maybe hardcoden
+            
+            iwpclose = np.where(self.swlnav*(dist < 10))[0] ## NOte --->> maybe hardcoden
+                        
+
             # Shift waypoints for aircraft i where necessary
             for i in iwpclose:
 
@@ -719,7 +839,7 @@ class Traffic:
                 qdr[i] = degrees(atan2(dx,dy))                    
 
                 self.actwpturn[i] = self.actwpflyby[i]*                     \
-                     max(3.,abs(turnrad*tan(radians(0.5*degto180(qdr[i]-    \
+                     max(10.,abs(turnrad*tan(radians(0.5*degto180(qdr[i]-    \
                      self.route[i].wpdirfrom[self.route[i].iactwp])))))  # [nm]                
 
             # End of Waypoint switching loop
@@ -773,13 +893,14 @@ class Traffic:
         # ASAS AP switches
 
         #--------- Input to Autopilot settings to follow: destination or ASAS ----------
-
+        #import pdb
+        #pdb.set_trace()
         # desired autopilot settings due to ASAS
         self.deshdg = self.asasactive*self.asashdg + (1-self.asasactive)*self.ahdg
-        self.desspd = self.asasactive*self.asasspd + (1-self.asasactive)*self.aspd
+        self.desspd = self.asasactive*self.asasspd + (1-self.asasactive)*self.aptas
         self.desalt = self.asasactive*self.asasalt + (1-self.asasactive)*self.aalt
         self.desvs  = self.asasactive*self.asasvsp + (1-self.asasactive)*self.avs
-
+        
         # check for the flight envelope
         self.perf.limits()
 
@@ -787,23 +908,24 @@ class Traffic:
 
         # Autopilot selected speed setting [m/s]
         # To do: add const Mach const CAS mode
-        self.aspd = (self.lspd ==0)*self.desspd + (self.lspd!=0)*self.lspd
+        self.desspd = ((self.desspd<vcas2tas(self.lspd,self.alt)) + ( self.lspd == 0.0 ))*self.desspd + (self.desspd>vcas2tas(self.lspd,self.alt))*vcas2tas(self.lspd,self.alt)
+
 
         # Autopilot selected altitude [m]
-        self.aalt = (self.lalt ==0)*self.desalt + (self.lalt!=0)*self.lalt
+        self.desalt = (self.lalt ==0)*self.desalt + (self.lalt!=0)*self.lalt
 
         # Autopilot selected heading
-        self.ahdg = self.deshdg
+        self.deshdg = self.deshdg
 
         # Autopilot selected vertical speed (V/S)
-        self.avs = (self.lvs==0)*self.desvs + (self.lvs!=0)*self.lvs
+        self.desvs = (self.lvs==0)*self.desvs + (self.lvs!=0)*self.lvs
 
         # below crossover altitude: CAS=const, above crossover altitude: MA = const
         #climb/descend above crossover: Ma = const, else CAS = const  
         #ama is fixed when above crossover
         check = self.abco*(self.ama == 0.)
         swma = np.where(check==True)
-        self.ama[swma] = vcas2mach(self.aspd[swma], self.alt[swma])
+        self.ama[swma] = vcas2mach(self.desspd[swma], self.alt[swma])
 
         # ama is deleted when below crossover
         check2 = self.belco*(self.ama!=0.)
@@ -818,12 +940,12 @@ class Traffic:
 # no more ?       self.aptas = (self.actwpspd > 0.01)*self.actwpspd*self.swvnav + \
 #                            np.logical_or((self.actwpspd <= 0.01),np.logical_not (self.swvnav))*self.aptas
 
-        self.delspd = self.aptas - self.tas 
+        self.delspd = self.desspd - self.tas
         swspdsel = np.abs(self.delspd) > 0.4  # <1 kts = 0.514444 m/s
         ax = np.minimum(abs(self.delspd / max(1e-8,simdt)), self.ax)
 
         self.tas = swspdsel * (self.tas + ax * np.sign(self.delspd) *  \
-                                          simdt) + (1. - swspdsel) * self.aptas
+                                          simdt) + (1. - swspdsel) * self.tas
 
         # Speed conversions
         self.cas = vtas2cas(self.tas, self.alt)
@@ -837,18 +959,18 @@ class Traffic:
 
         # update altitude
         self.eps = np.array(self.ntraf * [0.01])  # almost zero for misc purposes
-        swaltsel = np.abs(self.aalt-self.alt) >      \
+        swaltsel = np.abs(self.desalt-self.alt) >      \
                   np.maximum(3.,np.abs(2. * simdt * np.abs(self.vs))) # 3.[m] = 10 [ft] eps alt
 
-        self.vs = swaltsel*np.sign(self.aalt-self.alt)*       \
+        self.vs = swaltsel*np.sign(self.desalt-self.alt)*       \
                     ( (1-self.swvnav)*np.abs(1500./60.*ft) +    \
-                      self.swvnav*np.abs(self.avs)         )
+                      self.swvnav*np.abs(self.desvs)         )
 
         self.alt = swaltsel * (self.alt + self.vs * simdt) +   \
-                   (1. - swaltsel) * self.aalt + turbalt
+                   (1. - swaltsel) * self.desalt + turbalt
 
         # HDG HOLD/SEL mode: ahdg = ap selected heading
-        delhdg = (self.ahdg - self.trk + 180.) % 360 - 180.  # [deg]
+        delhdg = (self.deshdg - self.trk + 180.) % 360 - 180.  # [deg]
 
         # omega = np.degrees(g0 * np.tan(self.aphi) / \
         # np.maximum(self.tas, self.eps))
@@ -880,9 +1002,177 @@ class Traffic:
         else:
             self.lastlat = self.lat
             self.lastlon = self.lon
+            self.lattime = simt
+            
+        # ----------------Logger----------------
+        #Thom flight statistics:
+        self.distance_2D    = self.distance_2D + simdt * self.gs # [m]
+        self.distance_3D    = self.distance_3D + simdt * np.sqrt(self.gs**2 + self.vs**2) # [m]
+        self.flightime      = self.flightime + simdt # [sec]
+        self.work           = self.work + self.perf.Thr * simdt * self.tas # [work] 
+        #End Flight Statistics
+        
+        #Start flight statistics logger
+        if simt >= self.ExperimentStart and simt <= self.ExperimentEnd \
+        and(self.FlstSwitch)and((self.Flstt0+self.Flstdt)<simt):
+            self.Flstt0=simt
+            
+            condition1 = np.where(np.array(kwikdist(self.DeleteCenterLatLon[0],self.DeleteCenterLatLon[1],self.lat,self.lon) )[0] <= self.ExperimentRadius )[0]
+            condition2=np.where(self.createtime >= self.ExperimentStart)    # Check Created after experiment time
+            condition3=np.where(self.createtime <= self.ExperimentEnd)      # Check created before experiment end
+            conditions=np.intersect1d(condition1,condition2) #check common values for conditions (in area) and created after experiment starttime
+            conditions=np.intersect1d(conditions,condition3) #check for third   
+            
+            for i in range(self.ntraf):
+                if i in conditions:             # check with conditions
+                                                
+                    # Temp ReWrite test
+                    writedlines = self.log.writetxt(simt,'%s,%s,%s,%s,%s,%s,%s,%s' % \
+                                               (simt,self.id[i],self.type[i],self.createtime[i], self.distance_2D[i],\
+                                               self.distance_3D[i], self.flightime[i], self.work[i]\
+                                                )) #Return distance in NM
+                    self.log.buffer_Flst.append(writedlines)  
+        #end flight statistics logger
+        
+        
+        
+        #Start Snap logger
+        if simt >= self.ExperimentStart and simt <= self.ExperimentEnd \
+        and(self.SnapSwitch)and((self.Snapt0+self.Snapdt)<simt):
+            self.Snapt0=simt
+            # Check if Createtime is right and is inside (circular) area
+            
+            condition1 = np.where(np.array(kwikdist(self.DeleteCenterLatLon[0],self.DeleteCenterLatLon[1],self.lat,self.lon) )[0] <= self.ExperimentRadius)[0]
+            condition2=np.where(self.createtime >= self.ExperimentStart)    # Check Created after experiment time
+            condition3=np.where(self.createtime <= self.ExperimentEnd)      # Check created before experiment end
+            conditions=np.intersect1d(condition1,condition2) #check common values for conditions (in area) and created after experiment starttime
+            conditions=np.intersect1d(conditions,condition3) #check for third
+
+            
+            
+            for i in range(self.ntraf):
+                if i in conditions:             # check with conditions
+                    
+                    writedlines = self.log.writetxt(simt,'%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' % \
+                                               (simt,self.id[i],self.type[i],self.createtime[i], \
+                                                self.lat[i],self.lon[i],self.alt[i], \
+                                                self.tas[i],self.gs[i],self.vs[i],self.cas[i], self.trk[i], \
+                                                self.adsb.recepProbInterf_db[i],np.mean(self.adsb.recepProbRange_db[i][:]),np.mean( self.adsb.recepProb_DB[i])\
+                                                ))
+                                                
+                   
+                    self.log.buffer_Snap.append(writedlines)  
+                                        
+                                        
+                                        
+            
+        else:
+            pass     
+        #End Snap logger
+        
+        #Start TMX logger
+        if self.TmxSwitch: # No switch for if aircraft is in area (maybe do with specific flight time???)
+            if self.Tmxt0+self.Tmxdt<simt or simt<self.Tmxt0:
+                self.Tmxt0 = simt
+                
+                writedlines = self.log.writetxt(simt,'%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' % \
+                               (simt,self.ntraf,len(self.dbconf.conflist_now),len(self.dbconf.LOSlist_now),\
+                               np.mean(self.adsb.recepProbInterf_db),np.mean(self.adsb.recepProbRange_db),np.mean( self.adsb.recepProb_DB),\
+                               np.count_nonzero(self.ACInArea), (self.ntraf-np.count_nonzero(self.ACInArea)), len(self.dbconf.conflist_exp),len(self.dbconf2.conflist_exp), \
+                               len(self.dbconf.conflist_all),len(self.dbconf2.conflist_all)\
+                               ))
+                self.log.buffer_Tmx.append(writedlines)
+        #end TMX logger
+          
+          
+        #Global variables switch
+        if self.GlobSwitch and simt>=30 and self.GlobSwitch2:
+            
+            
+            writedlines = self.log.writetxt(simt,'%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' % \
+                               (simt,self.log.ScenName,\
+                               self.adsb.sigma_lat,self.adsb.sigma_lon,\
+                               self.adsb.R0,self.adsb.AdsbMessageTime,self.adsb.update_rate,\
+                               self.ExperimentStart,self.ExperimentEnd,self.ExperimentRadius,\
+                               self.DeleteDistance,self.DeleteSwitch\
+                               ))
+            
+            self.log.buffer_Glob.append(writedlines)
+            self.GlobSwitch2=False
+
+            
+       
+        #Write Logfiles
+        if self.t0writelog+self.dtwritelog<simt or simt<self.t0writelog:
+            self.t0writelog = simt
+            if self.TmxSwitch:     #Only if Snap is enabled
+                self.log.savetxt(0) # Zie hierboven (real locations)
+                self.log.buffer_Tmx=[] # and clear buffer
+            if self.SnapSwitch:     #Only if Snap is enabled
+                self.log.savetxt(1) 
+                self.log.buffer_Snap=[] # and clear buffer
+            if self.ConfSwitch:     #Only if Conf is enabled
+                #pdb.set_trace()
+                self.log.savetxt(2) # 
+                self.log.buffer_Conf=[] # and clear buffer
+            if self.IntSwitch:     #Only if xx is enabled
+                #pdb.set_trace()
+                self.log.savetxt(3) # Intrusion
+                self.log.buffer_Int=[] # and clear buffer
+            if self.FlstSwitch:
+                self.log.savetxt(4) #flight statistiocs
+                self.log.buffer_Flst=[]
+            if self.GlobSwitch and simt >= 35:
+                self.log.savetxt(5) #flight statistiocs
+                #pdb.set_trace()
+                self.GlobSwitch = False #Log only once all global variables
+                
+
             self.lasttim[:] = simt
 
+
         # ----------------AREA check----------------
+        # Circular Area check
+        if self.DeleteSwitch == True and simt >= 3 and self.ntraf != 0\
+        and (self.t0Delete+self.dtDelete<simt or simt<self.t0Delete):
+            
+            self.t0Delete=simt
+            self.DistanceList= kwikdist(self.DeleteCenterLatLon[0],self.DeleteCenterLatLon[1],self.lat[:],self.lon[:])
+            OutRegionList = np.asarray( (self.DistanceList[:] >= self.DeleteDistance) )[0] # Reshape
+            self.DeleteIdx=np.where(OutRegionList)[0]
+            
+            DeleteId=np.array([])
+            
+            if np.size(self.DeleteIdx) != 0: #check if not empty
+                for i in self.DeleteIdx: #Create vectors with IDs to be deleted
+                    
+                    DeleteId=np.append(DeleteId,self.id[i])
+            
+                for i in range(np.size(DeleteId)): #Delete IDs in DeleteId
+                    
+                    if (self.createtime[self.id2idx(DeleteId[i])] + 600) <= simt: # + 10 min
+                        #pdb.set_trace()
+                        self.delete(DeleteId[i])
+                    else:
+                        pass
+            else:
+                pass
+        # End Circular Area Check
+                
+        #Ad data if AC is in area: ACInArea
+        
+        
+        AreaDistanceList= kwikdist(self.DeleteCenterLatLon[0],self.DeleteCenterLatLon[1],self.lat[:],self.lon[:])
+        OutAreaList = np.where( np.asarray(AreaDistanceList[:] >= self.ExperimentRadius )[0])[0] # Reshape
+        InAreaList = np.where( np.asarray(AreaDistanceList[:] < self.ExperimentRadius )[0])[0] # Reshape
+        
+        self.ACInArea[OutAreaList] = False
+        self.ACInArea[InAreaList] = True
+        
+                
+        # AcInRange
+            
+            
         # Update area once per areadt seconds:
         if self.swarea and abs(simt - self.areat0) > self.areadt:
             # Update loop timer
@@ -921,32 +1211,14 @@ class Traffic:
         except:
             return -1
 
-    def setTrails(self, *args):
-        """ Set trails on/off, or change trail color of aircraft """
-        if type(args[0]) == bool:
-            # Set trails on/off
-            self.swtrails = args[0]
-            if len(args) > 1:
-                self.trails.dt = args[1]
-            if not self.swtrails:
-                self.trails.clear()
-        else:
-            # Change trail color
-            if len(args) < 2 or args[2] not in ["BLUE", "RED", "YELLOW"]:
-                return False, "Set aircraft trail color with: TRAIL acid BLUE/RED/YELLOW"
-            self.changeTrailColor(args[1], args[0])
-
     def changeTrailColor(self, color, idx):
         """Change color of aircraft trail"""
         self.trailcol[idx] = self.trails.colorList[color]
         return
 
-    def setNoise(self, noiseflag=None):
+    def setNoise(self, A):
         """Noise (turbulence, ADBS-transmission noise, ADSB-truncated effect)"""
-        if noiseflag is None:
-            return True, "Noise is currently " + ("on" if noiseflag else "off")
-
-        self.noise              = noiseflag
+        self.noise              = A
         self.trunctime          = 1                   # seconds
         self.transerror         = [1, 100, 100 * ft]  # [degree,m,m] standard bearing, distance, altitude error
         self.standardturbulence = [0, 0.1, 0.1]       # m/s standard turbulence  (nonnegative)
@@ -963,260 +1235,28 @@ class Traffic:
 
     def selhdg(self, idx, hdg):  # HDG command
         """ Select heading command: HDG acid, hdg """
+        if idx < 0:
+            return False  # Aircraft not found
+
         # Give autopilot commands
         self.ahdg[idx]   = float(hdg)
         self.swlnav[idx] = False
         # Everything went ok!
         return True
 
-    def selspd(self, idx, casmach):  # SPD command
-        """ Select speed command: SPD acid, casmach (= CASkts/Mach) """
-        # When >=1.0 it is probably CASkts else it is Mach
-        if 0.1 < casmach < 1.0:
-            self.aspd[idx] = mach2cas(casmach, self.alt[idx])  # Convert Mach to CAS m/s
-            self.ama[idx]  = casmach
+    def selspd(self, idx, spd):  # SPD command
+        """ Select speed command: SPD acid, spd (= CASkts/Mach) """
+        if idx < 0:
+            return False  # Aircraft not found
+
+        # When >=2.0 it is probably CASkts else it is Mach
+        if spd >= 2.0:
+            self.aspd[idx] = spd * kts  # CAS m/s
+            self.ama[idx]  = cas2mach(spd*kts, self.alt[idx])
         else:
-            self.aspd[idx] = casmach  # CAS m/s
-            self.ama[idx]  = cas2mach(casmach, self.alt[idx])
+            self.aspd[idx] = mach2cas(spd) # Convert Mach to CAS m/s
+            self.ama[idx]  = spd
         # Switch off VNAV: SPD command overrides
-        self.swvnav[idx]   = False
-
-        return True
-
-    def move(self, idx, lat, lon, alt=None, hdg=None, casmach=None, vspd=None):
-        self.lat[idx]      = lat
-        self.lon[idx]      = lon
-
-        if alt:
-            self.alt[idx]  = alt
-            self.aalt[idx] = alt
-
-        if hdg:
-            self.trk[idx]  = hdg
-            self.ahdg[idx] = hdg
-
-        if casmach:
-            # Convert speed
-            if 0.1 < casmach < 1.0:
-                self.tas[idx]  = mach2tas(casmach, alt)
-                self.aspd[idx] = mach2cas(casmach, alt)
-            else:
-                self.tas[idx]  = cas2tas(casmach, alt)
-                self.aspd[idx] = casmach
-
-        if vspd:
-            self.vs[idx]       = vspd
-            self.swvnav[idx]   = False
-
-    def selalt(self, idx, alt, vspd=None):
-        """ Select altitude command: ALT acid, alt, [vspd] """
-        self.aalt[idx]    = alt
-        self.afll[idx]    = alt / (100. * ft)
-        self.swvnav[idx]  = False
-
-        # Check for optional VS argument
-        if vspd:
-            self.avs[idx] = vspd
-        else:
-            delalt        = alt - self.alt[idx]
-            # Check for VS with opposite sign => use default vs
-            # by setting autopilot vs to zero
-            if self.avs[idx] * delalt < 0. and abs(self.avs[idx]) > 0.01:
-                self.avs[idx] = 0.
-
-    def selvspd(self, idx, vspd):
-        """ Vertical speed autopilot command: VS acid vspd """
-        self.avs[idx] = vspd
-        # self.vs[idx] = vspd
         self.swvnav[idx] = False
 
-    def nom(self, idx):
-        """ Reset acceleration back to nominal (1 kt/s^2): NOM acid """
-        self.ax[idx] = kts
-
-    def setTaxi(self, flag):
-        """ Set taxi delete flag: OFF auto deletes traffic below 1500 ft """
-        self.swtaxi = flag
-
-    def setLNAV(self, idx, flag=None):
-        """ Set LNAV on or off for a specific or for all aircraft """
-        if idx is None:
-            # All aircraft are targeted
-            self.swlnav = np.array(self.ntraf*[flag])
-
-        elif flag is None:
-            return True, (self.id[idx] + ": LNAV is " + "ON" if self.swlnav[idx] else "OFF")
-
-        elif flag:
-            route = self.route[idx]
-            if route.nwp > 0:
-                self.swlnav[idx] = True
-                route.direct(self, idx, route.wpname[route.findact(self, idx)])
-            else:
-                return False, ("LNAV " + self.id[idx] + ": no waypoints or destination specified")
-        else:
-            self.swlnav[idx] = False
-
-    def setVNAV(self, idx, flag=None):
-        """ Set VNAV on or off for a specific or for all aircraft """
-        if idx is None:
-            # All aircraft are targeted
-            self.swvnav = np.array(self.ntraf*[flag])
-
-        elif flag is None:
-            return True, (self.id[idx] + ": VNAV is " + "ON" if self.swvnav[idx] else "OFF")
-
-        elif flag:
-            if not self.swlnav[idx]:
-                return False, (self.id[idx] + ": VNAV ON requires LNAV to be ON")
-
-            route = self.route[idx]
-            if route.nwp > 0:
-                self.swvnav[idx] = True
-                route.direct(self, idx, route.wpname[route.findact(self, idx)])
-            else:
-                return False, ("VNAV " + self.id[idx] + ": no waypoints or destination specified")
-        else:
-            self.swvnav[idx] = False
-
-    def setDestOrig(self, cmd, idx, *args):
-        if len(args) == 0:
-            if cmd == 'DEST':
-                return True, ('DEST ' + self.id[idx] + ': ' + self.dest[idx])
-            else:
-                return True, ('ORIG ' + self.id[idx] + ': ' + self.orig[idx])
-
-        route = self.route[idx]
-        if len(args) == 1:
-            name = args[0]
-            apidx = self.navdb.getapidx(name)
-            if apidx < 0:
-                return False, (cmd + ": Airport " + name + " not found.")
-            lat = self.navdb.aplat[apidx]
-            lon = self.navdb.aplon[apidx]
-        else:
-            name = self.id[idx] + cmd
-            lat, lon = args
-
-        if cmd == "DEST":
-            self.dest[idx] = name
-            iwp = route.addwpt(self, idx, self.dest[idx], route.dest,
-                               lat, lon, 0.0, self.cas[idx])
-            # If only waypoint: activate
-            if (iwp == 0) or (self.orig[idx] != "" and route.nwp == 2):
-                self.actwplat[idx] = route.wplat[iwp]
-                self.actwplon[idx] = route.wplon[iwp]
-                self.actwpalt[idx] = route.wpalt[iwp]
-                self.actwpspd[idx] = route.wpspd[iwp]
-
-                self.swlnav[idx] = True
-                route.iactwp = iwp
-
-            # If not found, say so
-            elif iwp < 0:
-                return False, (self.dest[idx] + " not found.")
-
-        # Origin: bookkeeping only for now
-        else:
-            self.orig[idx] = name
-            iwp = route.addwpt(self, idx, self.orig[idx], route.orig,
-                               self.lat[idx], self.lon[idx], 0.0, self.cas[idx])
-            if iwp < 0:
-                return False, (self.orig[idx] + " not found.")
-
-    def acinfo(self, acid):
-        idx      = self.id.index(acid)
-        actype   = self.type[idx]
-        lat, lon = self.lat[idx], self.lon[idx]
-        alt, hdg = self.alt[idx], self.trk[idx]
-        cas      = tas2cas(self.tas[idx], self.alt[idx]) / kts
-        tas      = self.tas[idx] / kts
-        route    = self.route[idx]
-        line  = "Info on %s %s index = %d\n" % (acid, actype, idx) \
-              + "Pos = %.2f, %.2f. Spd: %d kts CAS, %d kts TAS\n" % (lat, lon, cas, tas) \
-              + "Alt = %d ft, Hdg = %d\n" % (alt, hdg)
-        if self.swlnav[idx] and route.nwp > 0 and route.iactwp >= 0:
-            if self.swvnav[idx]:
-                line += "VNAV, "
-            line += "LNAV to " + route.wpname[route.iactwp] + "\n"
-        if self.orig[idx] != "" or self.dest[idx] != "":
-            line += "Flying"
-            if self.orig[idx] != "":
-                line += " from " + self.orig[idx]
-            if self.dest[idx] != "":
-                line += " to " + self.dest[idx]
-
-        return line
-
-    def area(self, scr, metric, *args):
-        if args[0] == 'OFF':
-            self.swarea = False
-            self.area   = ""
-            scr.objappend(2, "AREA", None)  # delete square areas
-            scr.objappend(3, "AREA", None)  # delete circle areas
-            return True
-
-        if type(args[0]) == float and len(args) >= 4:
-            # This is a square area
-            self.arealat0 = min(args[0], args[2])
-            self.arealat1 = max(args[0], args[2])
-            self.arealon0 = min(args[1], args[3])
-            self.arealon1 = max(args[1], args[3])
-
-            if numargs == 5:
-                self.areafloor = args[4] * ft
-            else:
-                self.areafloor = -9999999.
-
-            self.area = "Square"
-            self.swarea = True
-            scr.objappend(2, "AREA", [args[0], args[1], args[2], args[3]])
-
-            # Avoid mass delete due to redefinition of area
-            self.inside = self.ntraf * [False]
-            return True
-        elif args[0] == "FIR" and len(args) <= 3:
-            for i in range(0, len(self.navdb.fir)):
-                if args[1] == self.navdb.fir[i][0]:
-                    break
-            if args[1] != self.navdb.fir[i][0]:
-                return False, "Unknown FIR, try again"
-
-            metric.fir_number        = i
-            metric.fir_circle_point  = metric.metric_Area.FIR_circle(self.navdb, metric.fir_number)
-            metric.fir_circle_radius = float(args[1])
-
-            if len(args) == 3:
-                self.areafloor = args[2] * ft
-            else:
-                self.areafloor = -9999999.
-
-            self.area   = "Circle"
-            self.swarea = True
-            self.inside = self.ntraf * [False]
-            scr.objappend(3, "AREA", [metric.fir_circle_point[0] , metric.fir_circle_point[1], metric.fir_circle_radius])
-            return True
-        elif args[0] == "CIRCLE" and len(args) in [4, 5]:
-            # draw circular experiment area
-            self.arealat0 = args[1]    # Latitude of circle center [deg]
-            self.arealon0 = args[2]    # Longitude of circle center [deg]
-            self.arearadius = args[3]  # Radius of circle Center [NM]
-
-            # Deleting traffic flying out of experiment area
-            self.area = "Circle"
-            self.swarea = True
-
-            if len(args) == 5:
-                self.areafloor = args[4] * ft  # [m]
-            else:
-                self.areafloor = -9999999.  # [m]
-
-            # draw the circular experiment area on the radar gui
-            scr.objappend(3, "AREA", [self.arealat0, self.arealon0, radius])
-
-            # Avoid mass delete due to redefinition of area
-            self.inside = self.ntraf * [False]
-
-            return True
-
-        return False
+        return True
